@@ -1,0 +1,271 @@
+*&---------------------------------------------------------------------*
+*& Include          ZSD_CREDIT_EVALUATION
+*&---------------------------------------------------------------------*
+TABLES: bsid, bsad.
+
+
+TYPES: BEGIN OF ty_bsad,
+         bukrs TYPE bsad-bukrs,
+         kunnr TYPE bsad-kunnr,
+         budat TYPE bsad-budat,
+         augdt TYPE bsad-augdt,
+         dmbtr TYPE bsad-dmbtr,
+       END OF ty_bsad.
+
+"--- BSID Type (Open Items)
+TYPES: BEGIN OF ty_bsid,
+         bukrs TYPE bsid-bukrs,
+         kunnr TYPE bsid-kunnr,
+         budat TYPE bsid-budat,
+         zfbdt TYPE bsid-zfbdt,
+         dmbtr TYPE bsid-dmbtr,
+       END OF ty_bsid.
+
+TYPES: BEGIN OF ty_output,
+         kunnr            TYPE kunnr,
+         name1            TYPE name1,
+         total_invoices   TYPE i,
+         total_payments   TYPE i,
+         avg_days_to_pay  TYPE i,
+         overdue_count    TYPE i,
+         outstanding_amt  TYPE dmbtr,
+         max_overdue_days TYPE i,
+         credit_rating    TYPE char20,
+       END OF ty_output.
+
+DATA: lt_bsad TYPE STANDARD TABLE OF ty_bsad,
+      ls_bsad TYPE ty_bsad,
+
+      lt_bsid TYPE STANDARD TABLE OF ty_bsid,
+      ls_bsid TYPE ty_bsid.
+
+DATA: gs_output TYPE ty_output.
+DATA gs_credit TYPE zai_credit.
+
+DATA: lv_days           TYPE i,
+      lv_sum_days       TYPE i,
+      lv_count          TYPE i,
+      lv_total_exposure TYPE bsid-dmbtr,
+      lv_credit_limit   TYPE knkk-klimk,
+      lv_risk_class     TYPE string,
+      html_string       TYPE string.
+STATICS: lv_first TYPE c.
+
+*---------------------------------------------------------------------*
+* Data Selection
+*---------------------------------------------------------------------*
+
+CHECK lv_first IS INITIAL.        " Come only first time
+
+SELECT SINGLE * FROM zai_credit
+                INTO gs_credit
+               WHERE kunnr = vbak-kunnr.
+
+IF gs_credit-exclude EQ abap_true.
+  RETURN.
+ENDIF.
+
+
+SELECT bukrs kunnr budat augdt dmbtr
+  INTO TABLE lt_bsad
+  FROM bsad
+  WHERE bukrs = 'JG01'
+    AND kunnr EQ vbak-kunnr.
+
+
+SELECT bukrs kunnr budat zfbdt dmbtr
+  INTO TABLE lt_bsid
+  FROM bsid
+  WHERE "bukrs = vbap-bukrs
+    kunnr  EQ vbak-kunnr.
+
+
+CLEAR: lv_sum_days, lv_count, gs_output-overdue_count, gs_output-max_overdue_days.
+
+LOOP AT lt_bsad INTO ls_bsad.
+  lv_days = ls_bsad-augdt - ls_bsad-budat.
+  lv_sum_days += lv_days.
+  lv_count += 1.
+ENDLOOP.
+
+LOOP AT lt_bsid INTO ls_bsid.
+  lv_days = sy-datum - ls_bsid-zfbdt.
+  lv_sum_days += lv_days.
+  lv_count += 1.
+
+  IF lv_days > 0.
+    gs_output-overdue_count += 1.
+    IF lv_days > gs_output-max_overdue_days.
+      gs_output-max_overdue_days = lv_days.
+    ENDIF.
+  ENDIF.
+ENDLOOP.
+
+IF lv_count > 0.
+  gs_output-avg_days_to_pay = lv_sum_days / lv_count.
+ENDIF.
+
+IF gs_output-max_overdue_days > 90.
+  IF gs_credit-high EQ abap_true.
+    RETURN.
+  ENDIF.
+  gs_output-credit_rating = 'High Risk'.
+ELSEIF gs_output-max_overdue_days > 30.
+  IF gs_credit-medium EQ abap_true.
+    RETURN.
+  ENDIF.
+
+  gs_output-credit_rating = 'Medium Risk'.
+ELSE.
+  IF gs_credit-low EQ abap_true.
+    RETURN.
+  ENDIF.
+  gs_output-credit_rating = 'Low Risk'.
+ENDIF.
+
+
+CLEAR lv_total_exposure.
+
+SELECT  bukrs kunnr budat zfbdt dmbtr
+  FROM bsid
+  INTO TABLE lt_bsid
+  WHERE kunnr EQ vbak-kunnr.
+
+lv_total_exposure = REDUCE dmbtr(
+INIT x = 0
+FOR wa IN lt_bsid
+NEXT x = x + wa-dmbtr ).
+
+" Credit Limit
+SELECT SINGLE klimk
+  INTO lv_credit_limit
+  FROM knkk
+  WHERE kunnr EQ vbak-kunnr
+    AND kkber = '1000'.
+
+gs_output-kunnr = vbak-kunnr.
+
+SELECT SINGLE name1
+  INTO gs_output-name1
+  FROM kna1
+  WHERE kunnr = vbak-kunnr.
+
+*---------------------------------------------------------------------*
+* Risk Logic
+*---------------------------------------------------------------------*
+
+IF lv_total_exposure > lv_credit_limit.
+  lv_risk_class = 'red'.
+ELSEIF lv_total_exposure > lv_credit_limit * '0.8'.
+  lv_risk_class = 'orange'.
+ELSE.
+  lv_risk_class = 'green'.
+ENDIF.
+
+*---------------------------------------------------------------------*
+* HTML Creation (SAP SAFE VERSION)
+*---------------------------------------------------------------------*
+
+CLEAR html_string.
+
+html_string =
+`<html><head>` &&
+`<style>` &&
+
+
+`body{margin:0;padding:0;background:#ffffff;` &&
+`font-family:Segoe UI,Arial;color:#222222;` &&
+`height:100%;}` &&
+
+`html{height:100%;}` &&
+
+`.container{width:70%;height:100%;` &&
+`margin:0 auto;padding:20px;box-sizing:border-box;}` &&
+
+
+`.title{text-align:center;font-size:22px;` &&
+`font-weight:bold;margin-bottom:20px;}` &&
+
+`table{width:100%;height:90%;border-spacing:20px;}` &&
+
+
+`td{width:50%;height:33%;` &&
+`border-radius:20px;text-align:center;` &&
+`vertical-align:middle;` &&
+`box-shadow:0 6px 20px rgba(0,0,0,0.6);}` &&
+
+`.label{font-size:16px;font-weight:600;}` &&
+`.value{font-size:38px;font-weight:900;margin-top:10px;}` &&
+
+`.blue{background:#2193b0;}` &&
+`.purple{background:#8e2de2;}` &&
+`.magenta{background:#cc2b5e;}` &&
+`.green{background:#11998e;}` &&
+`.orange{background:#f7971e;}` &&
+`.red{background:#ff416c;}` &&
+
+`</style></head><body>` &&
+
+`<div class="container">` &&
+`<div class="title">Credit Risk Dashboard</div>` &&
+
+`<table>` &&
+`<tr>` &&
+
+`<td class="blue">` &&
+`<div class="label">Customer</div>` &&
+`<div class="value">` && gs_output-kunnr && `</div>` &&
+`<div class="label">` && gs_output-name1 && `</div>` &&
+`</td>` &&
+
+`<td class="purple">` &&
+`<div class="label">Credit Limit</div>` &&
+`<div class="value">` && lv_credit_limit && `</div>` &&
+`</td>` &&
+
+`</tr>` &&
+`<tr>` &&
+
+`<td class="magenta">` &&
+`<div class="label">Open Items</div>` &&
+`<div class="value">` && lv_total_exposure && `</div>` &&
+`</td>` &&
+
+`<td class="` && lv_risk_class && `">` &&
+`<div class="label">Exposure Status</div>` &&
+`<div class="value">` && lv_total_exposure && `</div>` &&
+`</td>` &&
+
+`</tr>` &&
+
+`<tr>` &&
+
+`<td class="blue">` &&
+`<div class="label">Avg Days to Pay</div>` &&
+`<div class="value">` && gs_output-avg_days_to_pay && `</div>` &&
+`</td>` &&
+
+`<td class="green">` &&
+`<div class="label">Credit Rating</div>` &&
+`<div class="value">` && gs_output-credit_rating && `</div>` &&
+`</td>` &&
+
+`</tr>` &&
+
+
+`</table>` &&
+
+`</div></body></html>`.
+
+*---------------------------------------------------------------------*
+* Display
+*---------------------------------------------------------------------*
+
+cl_abap_browser=>show_html(
+  EXPORTING
+    html_string = html_string
+    size        = 'M'
+    title       = 'Customer Payment Trend'
+).
+
+lv_first = abap_true.
