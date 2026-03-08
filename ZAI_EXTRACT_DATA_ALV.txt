@@ -1,0 +1,622 @@
+*&---------------------------------------------------------------------*
+*& Report ZAI_EXTRACT_DATA
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+*&---------------------------------------------------------------------*
+*& 1)Addition of logic for Create invoice                              *
+*& 2)Check logic for rejected quantity added                           *
+*& Following addition's 1 , 2 are made                                 *
+*&---------------------------------------------------------------------*
+REPORT zai_extract_data_alv.
+
+*---------------------------------------------------------------------*
+* TYPES
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_field,
+         name  TYPE string,
+         value TYPE string,
+       END OF ty_field.
+
+TYPES ty_field_tab TYPE STANDARD TABLE OF ty_field WITH EMPTY KEY.
+ DATA: lv_sales_dash TYPE string.  "new added for the sales dashboard
+
+*---------------------------------------------------------------------*
+* PARAMETERS
+*---------------------------------------------------------------------*
+PARAMETERS: p_jobid TYPE string LOWER CASE OBLIGATORY.
+
+*---------------------------------------------------------------------*
+* DATA
+*---------------------------------------------------------------------*
+DATA: gv_token TYPE string.
+CONSTANTS:
+
+
+  gc_api_path TYPE string VALUE
+    '/document-information-extraction/v1'.
+DATA(gc_base_url) = |https://jade-build-9os78gml.ap10.doc.cloud.sap/document-information-extraction/v1/document/jobs/{ p_jobid }|.
+
+DATA:
+  go_container TYPE REF TO cl_gui_custom_container,
+  go_alv       TYPE REF TO cl_gui_alv_grid,
+  gt_alv       TYPE ty_field_tab,
+  gv_mode      TYPE char10. " HEADER / ITEMS
+
+DATA: gt_header_fields   TYPE ty_field_tab,
+      gt_lineitem_fields TYPE ty_field_tab,
+      gt_invoice_number TYPE ty_field_tab, "new added
+      gt_sales_dashboard TYPE ty_field_tab. "new added
+
+
+*---------------------------------------------------------------------*
+* CLASS
+*---------------------------------------------------------------------*
+CLASS lcl_dox_reader DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      authenticate,
+      read_document
+        IMPORTING i_jobid          TYPE string
+        RETURNING VALUE(rt_fields) TYPE ty_field_tab.
+ENDCLASS.
+
+CLASS lcl_alv_handler DEFINITION.
+  PUBLIC SECTION.
+    METHODS:
+      handle_toolbar
+        FOR EVENT toolbar OF cl_gui_alv_grid
+        IMPORTING e_object e_interactive,
+
+      handle_user_command
+        FOR EVENT user_command OF cl_gui_alv_grid
+        IMPORTING e_ucomm.
+ENDCLASS.
+
+CLASS lcl_alv_handler IMPLEMENTATION.
+
+  METHOD handle_toolbar.
+    DATA ls_button TYPE stb_button.
+
+    CLEAR ls_button.
+    ls_button-function = 'HEADER'.
+    ls_button-text     = 'Header'.
+    ls_button-icon     = icon_header.
+    ls_button-quickinfo = 'Show Header Fields'.
+    APPEND ls_button TO e_object->mt_toolbar.
+
+    CLEAR ls_button.
+    ls_button-function = 'ITEMS'.
+    ls_button-text     = 'Line Items'.
+    ls_button-icon     = icon_detail.
+    ls_button-quickinfo = 'Show Line Items'.
+    APPEND ls_button TO e_object->mt_toolbar.
+
+    CLEAR ls_button.
+    ls_button-function = 'CREATE_INV'.
+    ls_button-text     = 'Create Invoice'.
+    ls_button-icon     = icon_document.
+    ls_button-quickinfo = 'Generate Invoice'.
+    APPEND ls_button TO e_object->mt_toolbar.
+
+    CLEAR ls_button.
+    ls_button-function = 'SALES_DASH'.
+    ls_button-text     = 'Sales Dashboard'.
+    ls_button-icon     = icon_document.
+    ls_button-quickinfo = 'Sales Dashboard'.
+    APPEND ls_button TO e_object->mt_toolbar.
+
+  ENDMETHOD.
+
+  METHOD handle_user_command.
+    CASE e_ucomm.
+      WHEN 'HEADER'.
+        gv_mode = 'HEADER'.
+      WHEN 'ITEMS'.
+        gv_mode = 'ITEMS'.
+      WHEN 'CREATE_INV'.
+        " Call the new form to handle new logic
+        PERFORM prepare_and_create_invoice.
+      WHEN 'SALES_DASH'.
+        PERFORM sales_dashboard.
+         SUBMIT ZOTC_CUST_DASHBOARD_HTML WITH p_vbeln = lv_sales_dash.
+    ENDCASE.
+
+    PERFORM refresh_alv.
+  ENDMETHOD.
+
+ENDCLASS.
+
+*---------------------------------------------------------------------*
+* CLASS IMPLEMENTATION
+*---------------------------------------------------------------------*
+CLASS lcl_dox_reader IMPLEMENTATION.
+
+  METHOD authenticate.
+
+    DATA lo_client TYPE REF TO if_http_client.
+
+    cl_http_client=>create_by_destination(
+      EXPORTING destination = 'BTP_TOOL_CONNECT'
+      IMPORTING client      = lo_client
+    ).
+
+    lo_client->request->set_header_field(
+      name  = if_http_header_fields_sap=>request_method
+      value = 'POST'
+    ).
+
+    lo_client->request->set_header_field(
+      name  = if_http_header_fields_sap=>request_uri
+      value = '/oauth/token?grant_type=client_credentials'
+    ).
+
+    lo_client->send( ).
+    lo_client->receive( ).
+
+    DATA(lv_json) = lo_client->response->get_cdata( ).
+
+    SPLIT lv_json AT '"access_token":"' INTO DATA(lv_dummy) lv_json.
+    SPLIT lv_json AT '"' INTO gv_token lv_dummy.
+
+    lo_client->close( ).
+
+  ENDMETHOD.
+
+  METHOD read_document.
+    TYPES: BEGIN OF ty_extracted_field,
+             name  TYPE string,
+             value TYPE string,
+           END OF ty_extracted_field.
+
+    TYPES ty_t_extracted TYPE STANDARD TABLE OF ty_extracted_field
+           WITH EMPTY KEY.
+
+    DATA: lo_client TYPE REF TO if_http_client,
+          lr_data   TYPE REF TO data.
+
+    DATA: lv_http_code TYPE i,
+          lv_json      TYPE string,
+          lv_index     TYPE i VALUE 1,
+          ls_field     TYPE ty_extracted_field.
+    DATA lv_status TYPE string.
+
+
+
+
+    cl_http_client=>create_by_url(
+  EXPORTING url = gc_base_url
+  IMPORTING client = lo_client
+).
+
+
+    lo_client->request->set_header_field(
+      name  = 'Authorization'
+      value = |Bearer { gv_token }|
+    ).
+
+    lo_client->request->set_header_field(
+      name  = 'Accept'
+      value = 'application/json'
+    ).
+
+    lo_client->send( ).
+    lo_client->receive( ).
+
+    lv_json = lo_client->response->get_cdata( ).
+
+    /ui2/cl_json=>deserialize(
+      EXPORTING json = lv_json
+      CHANGING  data = lr_data
+    ).
+
+    lo_client->close( ).
+
+    " ---------------- JSON NAVIGATION ----------------
+
+    FIELD-SYMBOLS:
+
+      <ls_extraction>   TYPE any,
+      <lt_headerfields> TYPE STANDARD TABLE.
+
+    TYPES: BEGIN OF ty_field,
+             name  TYPE string,
+             value TYPE string,
+           END OF ty_field.
+
+    DATA: ty_field_tab TYPE STANDARD TABLE OF ty_field WITH EMPTY KEY.
+
+    FIELD-SYMBOLS:
+      <ls_root>  TYPE any,
+      <ls_hf>    TYPE any,
+      <ls_li>    TYPE any,
+      <lv_name>  TYPE any,
+      <lv_value> TYPE any.
+
+
+    " Root
+    ASSIGN lr_data->* TO <ls_root>.
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+    " EXTRACTION
+    ASSIGN COMPONENT 'EXTRACTION' OF STRUCTURE <ls_root> TO <ls_extraction>.
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+    " HEADERFIELDS
+    WRITE:/ 'Header'.
+    ULINE.
+    ASSIGN COMPONENT 'HEADERFIELDS' OF STRUCTURE <ls_extraction>->* TO FIELD-SYMBOL(<lt_headerfields_fs>).
+
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+    LOOP AT <lt_headerfields_fs>->* ASSIGNING <ls_hf>.
+      CLEAR ls_field.
+
+      ASSIGN COMPONENT 'NAME'  OF STRUCTURE <ls_hf>->* TO <lv_name>.
+      ASSIGN COMPONENT 'VALUE' OF STRUCTURE <ls_hf>->* TO <lv_value>.
+
+      IF sy-subrc = 0.
+        ls_field-name = |{ <lv_name>->* }|.
+        ls_field-value = |{ <lv_value>->* }|.
+        APPEND ls_field TO ty_field_tab.
+        APPEND ls_field TO gt_header_fields.
+      ENDIF.
+    ENDLOOP.
+
+    SKIP 1.
+    ULINE.
+*Line items
+    REFRESH ty_field_tab.
+    WRITE:/ 'Line Items'.
+    ULINE.
+    ASSIGN COMPONENT 'LINEITEMS' OF STRUCTURE <ls_extraction>->* TO FIELD-SYMBOL(<lt_lineitems_fs>).
+
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+
+    LOOP AT <lt_lineitems_fs>->* ASSIGNING <ls_hf>.
+      CLEAR ls_field.
+
+      LOOP AT <ls_hf>->* ASSIGNING <ls_li>.
+        ASSIGN COMPONENT 'NAME'  OF STRUCTURE <ls_li>->* TO <lv_name>.
+        ASSIGN COMPONENT 'VALUE' OF STRUCTURE <ls_li>->* TO <lv_value>.
+
+        IF sy-subrc = 0.
+          ls_field-name = |{ <lv_name>->* }|.
+          ls_field-value = |{ <lv_value>->* }|.
+          APPEND ls_field TO ty_field_tab.
+          APPEND ls_field TO gt_lineitem_fields.
+
+        ENDIF.
+      ENDLOOP.
+    ENDLOOP.
+
+  ENDMETHOD.
+
+ENDCLASS.
+
+*---------------------------------------------------------------------*
+* START-OF-SELECTION
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  DATA(lo_reader) = NEW lcl_dox_reader( ).
+  DATA lt_fields TYPE ty_field_tab.
+
+  lo_reader->authenticate( ).
+  lt_fields = lo_reader->read_document( p_jobid ).
+
+  gv_mode = 'HEADER'.
+  gt_alv  = gt_header_fields.
+
+  CALL SCREEN 100.
+
+FORM refresh_alv.
+
+  CLEAR gt_alv.
+
+  IF gv_mode = 'HEADER'.
+    gt_alv = gt_header_fields.
+  ELSEIF gv_mode = 'ITEMS'.
+    gt_alv = gt_lineitem_fields.
+  ELSEIF gv_mode = 'CREATE_INV'.
+    gt_alv = gt_invoice_number.
+  ENDIF.
+
+  go_alv->refresh_table_display( ).
+
+ENDFORM.
+
+
+MODULE status_0100 OUTPUT.
+  SET PF-STATUS 'ALV'.
+  PERFORM display_alv.
+ENDMODULE.
+
+MODULE user_command_0100 INPUT.
+  CASE sy-ucomm.
+    WHEN 'BACK' OR 'EXIT' OR 'CANCEL'.
+      LEAVE PROGRAM.
+  ENDCASE.
+ENDMODULE.
+
+FORM display_alv.
+
+  DATA lo_handler TYPE REF TO lcl_alv_handler.
+
+  IF go_container IS INITIAL.
+
+    CREATE OBJECT go_container
+      EXPORTING
+        container_name = 'ALV_CONT'.
+
+    CREATE OBJECT go_alv
+      EXPORTING
+        i_parent = go_container.
+
+    CREATE OBJECT lo_handler.
+
+    SET HANDLER lo_handler->handle_toolbar      FOR go_alv.
+    SET HANDLER lo_handler->handle_user_command FOR go_alv.
+
+    go_alv->set_table_for_first_display(
+      EXPORTING
+        i_structure_name = 'TY_FIELD'
+      CHANGING
+        it_outtab = gt_alv
+    ).
+
+  ELSE.
+    go_alv->refresh_table_display( ).
+  ENDIF.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form prepare_and_create_invoice
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*& -->  p1        text
+*& <--  p2        text
+*&---------------------------------------------------------------------*
+FORM prepare_and_create_invoice .
+  " 1. Structures for Data Collection - Using packed decimals
+  TYPES: BEGIN OF ty_invoice_data,
+           item_no     TYPE posnr,
+           total_qty   TYPE p DECIMALS 3,
+           reject_qty  TYPE p DECIMALS 3,
+           invoice_qty TYPE p DECIMALS 3,
+           matnr       TYPE MATNR18,
+         END OF ty_invoice_data.
+
+  DATA: lt_invoice_data TYPE STANDARD TABLE OF ty_invoice_data,
+        ls_invoice_data TYPE ty_invoice_data.
+
+  DATA: lv_delivery_no TYPE vbeln.
+
+  " 2. BAPI Specific Data Declarations - CORRECTED TYPES
+  DATA: lt_billingdatain TYPE STANDARD TABLE OF bapivbrk,          " <-- Reverted to BAPIVBRK
+        ls_billingdatain TYPE bapivbrk,                            " <-- Reverted to BAPIVBRK
+        lt_return        TYPE STANDARD TABLE OF bapiret1,          " <-- Must be BAPIRET1
+        lt_success       TYPE STANDARD TABLE OF bapivbrksuccess,   " <-- Success
+        lt_errors        TYPE STANDARD TABLE OF bapivbrkerrors.    " <-- Error's
+
+  " ====================================================================
+  " STEP A: Get the Delivery Number from Header (Using 'SERIAL')
+  " ====================================================================
+  LOOP AT gt_header_fields INTO DATA(ls_header).
+    IF ls_header-name = 'SERIAL'.
+      lv_delivery_no = ls_header-value.
+      " Pad with leading zeros (e.g., 80000150 -> 0080000150)
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_delivery_no
+        IMPORTING
+          output = lv_delivery_no.
+    ENDIF.
+  ENDLOOP.
+
+  IF lv_delivery_no IS INITIAL.
+    MESSAGE 'Delivery Number (SERIAL) not found in header extraction.' TYPE 'I'.
+    RETURN.
+  ENDIF.
+
+" ====================================================================
+  " STEP A.1: Fetch Units of Measure from LIPS
+  " ====================================================================
+  TYPES: BEGIN OF ty_lips_uom,
+           posnr TYPE posnr,
+           vrkme TYPE vrkme,
+           matnr TYPE matnr,
+         END OF ty_lips_uom.
+
+  DATA: lt_lips_uom TYPE STANDARD TABLE OF ty_lips_uom.
+
+  " Grab the item numbers and units of measure for this specific delivery
+  SELECT posnr, vrkme, matnr
+    FROM lips
+    INTO TABLE @lt_lips_uom
+    WHERE vbeln = @lv_delivery_no.
+
+  IF sy-subrc <> 0.
+    MESSAGE 'Warning: Could not find items in LIPS for this delivery.' TYPE 'I'.
+  ENDIF.
+
+  " ====================================================================
+  " STEP B: Parse Line Items & Calculate Quantities
+  " ====================================================================
+  CLEAR ls_invoice_data.
+
+  LOOP AT gt_lineitem_fields INTO DATA(ls_field).
+
+    " When we hit 'NO', a new item block is starting.
+    " Save the PREVIOUS item we were building before starting the new one.
+    IF ls_field-name = 'NO'.
+      IF ls_invoice_data-item_no IS NOT INITIAL.
+        ls_invoice_data-invoice_qty = ls_invoice_data-total_qty - ls_invoice_data-reject_qty.
+
+        " Only invoice if there's an actual quantity remaining
+        IF ls_invoice_data-invoice_qty > 0.
+          APPEND ls_invoice_data TO lt_invoice_data.
+        ENDIF.
+      ENDIF.
+
+      " Clear the structure for the new item
+      CLEAR ls_invoice_data.
+
+      " Convert string '1.0' -> integer 1 -> item number '000010'
+      DATA(lv_item_int) = CONV i( CONV decfloat16( ls_field-value ) ).
+      lv_item_int = lv_item_int * 10.
+      ls_invoice_data-item_no = lv_item_int.
+
+      " ---------> ADD THIS RIGHT HERE <---------
+      " Pad the item number with leading zeros (e.g., '10' becomes '000010')
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = ls_invoice_data-item_no
+        IMPORTING
+          output = ls_invoice_data-item_no.
+      " -----------------------------------------
+      CONTINUE.
+    ELSEIF ls_field-name = 'SKU'.
+      ls_invoice_data-matnr = ls_field-value.
+
+        CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = ls_invoice_data-matnr
+        IMPORTING
+          output = ls_invoice_data-matnr.
+
+        CONTINUE.
+    ENDIF.
+
+    " Collect quantities for the current item block
+    CASE ls_field-name.
+      WHEN 'QTY'.
+        ls_invoice_data-total_qty = ls_field-value.
+      WHEN 'Reject'.
+        ls_invoice_data-reject_qty = ls_field-value.
+    ENDCASE.
+
+  ENDLOOP.
+  " CRITICAL: Don't forget to append the VERY LAST line item!  """"
+  IF ls_invoice_data-item_no IS NOT INITIAL.
+    ls_invoice_data-invoice_qty = ls_invoice_data-total_qty - ls_invoice_data-reject_qty.
+    IF ls_invoice_data-invoice_qty > 0.
+      APPEND ls_invoice_data TO lt_invoice_data.
+    ENDIF.
+  ENDIF.
+
+  IF lt_invoice_data IS INITIAL.
+    MESSAGE 'No valid quantities found to invoice (Qty - Reject <= 0).' TYPE 'I'.
+    RETURN.
+  ENDIF.
+  """
+
+
+  " ====================================================================
+  " STEP C: Populate BAPI Tables
+  " ====================================================================
+  LOOP AT lt_invoice_data INTO ls_invoice_data.
+    CLEAR ls_billingdatain.
+
+    ls_billingdatain-ref_doc    = lv_delivery_no.
+    ls_billingdatain-ref_item   = ls_invoice_data-item_no.
+    ls_billingdatain-req_qty    = ls_invoice_data-invoice_qty.
+    ls_billingdatain-material   = ls_invoice_data-matnr. "matnr
+    ls_billingdatain-ref_doc_ca = 'J'. " 'J' = Delivery Document Category
+
+    "Read the correct Unit of Measure for this item
+    READ TABLE lt_lips_uom INTO DATA(ls_uom) WITH KEY posnr = ls_invoice_data-item_no.
+    IF sy-subrc = 0.
+      ls_billingdatain-sales_unit = ls_uom-vrkme.
+*      ls_billingdatain-material   = ls_uom-matnr.
+    ELSE.
+      " Fallback just in case
+      ls_billingdatain-sales_unit = 'EA'.
+    ENDIF.
+
+
+    APPEND ls_billingdatain TO lt_billingdatain.
+  ENDLOOP.
+
+  " ====================================================================
+  " STEP D: Call BAPI to Create Invoice
+  " ====================================================================
+  CALL FUNCTION 'BAPI_BILLINGDOC_CREATEMULTIPLE'
+    TABLES
+      billingdatain = lt_billingdatain
+      return        = lt_return
+      success       = lt_success
+      errors        = lt_errors.
+
+  " ====================================================================
+  " STEP E: Error Handling & Commit
+  " ====================================================================
+  READ TABLE lt_return WITH KEY type = 'E' TRANSPORTING NO FIELDS.
+  DATA(lv_has_error) = sy-subrc.
+
+  IF lv_has_error <> 0.
+    READ TABLE lt_return WITH KEY type = 'A' TRANSPORTING NO FIELDS.
+    lv_has_error = sy-subrc.
+  ENDIF.
+
+  IF lv_has_error = 0. " Error found
+    CALL FUNCTION 'BAPI_TRANSACTION_ROLLBACK'.
+
+    " Grab the first error message to show the user
+    READ TABLE lt_return INTO DATA(ls_err) WITH KEY type = 'E'.
+    IF sy-subrc <> 0.
+      READ TABLE lt_return INTO ls_err WITH KEY type = 'A'.
+    ENDIF.
+
+    MESSAGE ls_err-message TYPE 'I' DISPLAY LIKE 'E'.
+
+  ELSE. " Success
+    CALL FUNCTION 'BAPI_TRANSACTION_COMMIT'
+      EXPORTING
+        wait = 'X'.
+
+    " Retrieve and display the generated Billing Document number
+*    READ TABLE lt_success INTO DATA(ls_success) INDEX 1.
+    IF lt_success[] IS NOT INITIAL.
+      LOOP AT lt_success INTO DATA(ls_success).
+      DATA: ls_invoice LIKE LINE OF gt_invoice_number.
+      ls_invoice-name  = 'Invoice Number'.
+      ls_invoice-value = ls_success-bill_doc.
+      APPEND ls_invoice TO gt_invoice_number.
+      ENDLOOP.
+*************      MESSAGE |Invoice { ls_success-bill_doc } created successfully!| TYPE 'S'.
+    ELSE.
+      MESSAGE 'Invoice creation un-successfull!' TYPE 'S'.
+    ENDIF.
+  ENDIF.
+ENDFORM.
+*&---------------------------------------------------------------------*
+*& Form sales_dashboard
+*&---------------------------------------------------------------------*
+*& text
+*&---------------------------------------------------------------------*
+*& -->  p1        text
+*& <--  p2        text
+*&---------------------------------------------------------------------*
+FORM sales_dashboard .
+  LOOP AT gt_header_fields INTO DATA(ls_header).
+    IF ls_header-name = 'SERIAL'.
+      lv_sales_dash = ls_header-value.
+      " Pad with leading zeros (e.g., 80000150 -> 0080000150)
+      CALL FUNCTION 'CONVERSION_EXIT_ALPHA_INPUT'
+        EXPORTING
+          input  = lv_sales_dash
+        IMPORTING
+          output = lv_sales_dash.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.

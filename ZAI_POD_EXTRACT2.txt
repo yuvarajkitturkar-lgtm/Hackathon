@@ -1,0 +1,491 @@
+*&---------------------------------------------------------------------*
+*& Report ZAI_POD_EXTRACT2
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zbpt_dox_extract2.
+
+CLASS lcl_doc_extract DEFINITION DEFERRED.
+
+*---------------------------------------------------------------------*
+* Types
+*---------------------------------------------------------------------*
+TYPES: BEGIN OF ty_file,
+         value TYPE x,
+       END OF ty_file.
+
+TYPES: BEGIN OF ty_extracted_field,
+         name  TYPE string,
+         value TYPE string,
+       END OF ty_extracted_field.
+
+TYPES ty_t_extracted TYPE STANDARD TABLE OF ty_extracted_field
+       WITH EMPTY KEY.
+
+*---------------------------------------------------------------------*
+* Selection screen
+*---------------------------------------------------------------------*
+PARAMETERS: p_file   TYPE rlgrap-filename,
+            p_schema TYPE hdb_schema_name DEFAULT 'PoD_Receipt'.
+
+DATA: gt_file        TYPE STANDARD TABLE OF ty_file,
+      gv_xstring     TYPE xstring,
+      gv_file_length TYPE i,
+      go_extract     TYPE REF TO lcl_doc_extract.
+
+*---------------------------------------------------------------------*
+* File picker
+*---------------------------------------------------------------------*
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_file.
+
+  DATA: lt_filetab TYPE filetable,
+        lv_rc      TYPE i.
+
+  cl_gui_frontend_services=>file_open_dialog(
+    CHANGING
+      file_table = lt_filetab
+      rc         = lv_rc ).
+
+  IF lv_rc > 0.
+    p_file = lt_filetab[ 1 ]-filename.
+  ENDIF.
+
+*---------------------------------------------------------------------*
+* Class definition
+*---------------------------------------------------------------------*
+CLASS lcl_doc_extract DEFINITION.
+
+  PUBLIC SECTION.
+
+    CONSTANTS:
+      c_base_url TYPE string VALUE
+*        'https://aiservices-dox.cfapps.ap10.hana.ondemand.com',
+        'https://jade-build-9os78gml.ap10.doc.cloud.sap/ui?clientId=default#/invoiceviewer',
+      c_api_path TYPE string VALUE
+        '/document-information-extraction/v1'.
+
+    DATA gv_token TYPE string.
+
+    METHODS:
+      authenticate
+        RETURNING VALUE(rv_ok) TYPE abap_bool,
+
+      post_document
+        IMPORTING
+          iv_file         TYPE xstring
+          iv_filename     TYPE string
+          iv_mime         TYPE string
+        RETURNING
+          VALUE(rv_jobid) TYPE string,
+
+
+      get_job_status
+        IMPORTING
+          iv_jobid         TYPE string
+        EXPORTING
+          et_fields        TYPE ty_t_extracted
+        RETURNING
+          VALUE(rv_status) TYPE string.
+
+ENDCLASS.
+
+*---------------------------------------------------------------------*
+* Class implementation
+*---------------------------------------------------------------------*
+CLASS lcl_doc_extract IMPLEMENTATION.
+
+*---------------------------------------------------------------------*
+* OAuth Authentication
+*---------------------------------------------------------------------*
+  METHOD authenticate.
+
+    DATA: BEGIN OF ls_token,
+            access_token TYPE string,
+          END OF ls_token.
+
+    DATA: lo_client TYPE REF TO if_http_client,
+          lv_json   TYPE string.
+
+    rv_ok = abap_false.
+
+    cl_http_client=>create_by_destination(
+      EXPORTING
+        destination = 'BTP_TOOL_CONNECT'
+      IMPORTING
+        client      = lo_client ).
+
+    lo_client->request->set_header_field( name = if_http_header_fields_sap=>request_method value = 'POST' ).
+    lo_client->request->set_header_field( name = 'grant_type' value = 'client_credentials' ).
+    lo_client->request->set_header_field( name = if_http_header_fields_sap=>request_uri value = '/oauth/token?grant_type=client_credentials' ).
+
+
+    lo_client->send( ).
+    lo_client->receive( ).
+
+    lv_json = lo_client->response->get_cdata( ).
+
+    /ui2/cl_json=>deserialize(
+      EXPORTING json = lv_json
+      CHANGING  data = ls_token ).
+
+    gv_token = ls_token-access_token.
+
+    IF gv_token IS NOT INITIAL.
+      rv_ok = abap_true.
+    ENDIF.
+
+    lo_client->close( ).
+
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+* Post document
+*---------------------------------------------------------------------*
+  METHOD post_document.
+
+    DATA:
+      lo_client    TYPE REF TO if_http_client,
+      lv_http_code TYPE i,
+      lv_response  TYPE string.
+
+    CLEAR rv_jobid.
+
+    cl_http_client=>create_by_url(
+      EXPORTING
+        url    = c_base_url
+      IMPORTING
+        client = lo_client ).
+
+*--- Request headers
+    lo_client->request->set_header_field(
+      name  = if_http_header_fields_sap=>request_method
+      value = if_http_request=>co_request_method_post ).
+
+    lo_client->request->set_header_field(
+      name  = if_http_header_fields_sap=>request_uri
+      value = |{ c_api_path }/document/jobs| ).
+
+    lo_client->request->set_header_field(
+      name  = 'Authorization'
+      value = |Bearer { gv_token }| ).
+
+    lo_client->request->set_header_field(
+      name  = 'Accept'
+      value = if_rest_media_type=>gc_appl_json ).
+
+    lo_client->request->set_content_type(
+      if_rest_media_type=>gc_multipart_form_data ).
+
+*------------------------------------------------------------------*
+* OPTIONS PART
+*------------------------------------------------------------------*
+    DATA(lo_opt_part) = lo_client->request->add_multipart( ).
+
+    lo_opt_part->set_header_field(
+      name  = 'Content-Disposition'
+      value = 'form-data; name="options"' ).
+
+    lo_opt_part->set_content_type(
+      if_rest_media_type=>gc_appl_json ).
+
+    DATA(lv_options) =
+      '{ "schemaName": "PoD_Receipt",' &&
+      '  "clientId": "default",' &&
+      '  "documentType": "Custom",' &&
+      '  "receivedDate": "2025-01-01" }'.
+
+    lo_opt_part->set_cdata( lv_options ).
+
+*------------------------------------------------------------------*
+* FILE PART
+*------------------------------------------------------------------*
+    DATA(lo_file_part) = lo_client->request->add_multipart( ).
+
+    lo_file_part->set_header_field(
+      name  = 'Content-Disposition'
+      value = |form-data; name="file"; filename="{ iv_filename }"| ).
+
+    lo_file_part->set_content_type( iv_mime ).
+
+    lo_file_part->set_data(
+      data   = iv_file
+      offset = 0
+      length = xstrlen( iv_file ) ).
+
+*------------------------------------------------------------------*
+* Send request
+*------------------------------------------------------------------*
+    lo_client->send( ).
+    lo_client->receive( ).
+
+    lo_client->response->get_status(
+      IMPORTING
+        code = lv_http_code ).
+
+    lv_response = lo_client->response->get_cdata( ).
+
+    IF lv_http_code = 201.
+
+      DATA: BEGIN OF ls_job,
+              id     TYPE string,
+              status TYPE string,
+            END OF ls_job.
+
+      /ui2/cl_json=>deserialize(
+        EXPORTING json = lv_response
+        CHANGING  data = ls_job ).
+
+      rv_jobid = ls_job-id.
+
+    ENDIF.
+
+    lo_client->close( ).
+
+  ENDMETHOD.
+
+*---------------------------------------------------------------------*
+* Get job status
+*---------------------------------------------------------------------*
+  METHOD get_job_status.
+
+    TYPES: BEGIN OF ty_field,
+             name  TYPE string,
+             value TYPE string,
+           END OF ty_field.
+
+    DATA: ty_field_tab TYPE STANDARD TABLE OF ty_field WITH EMPTY KEY.
+    DATA:
+      lo_client    TYPE REF TO if_http_client,
+      lv_http_code TYPE i,
+      lv_json      TYPE string,
+      lr_data      TYPE REF TO data,
+      lv_index     TYPE i VALUE 1,
+      ls_field     TYPE ty_extracted_field,
+      lv_status    TYPE string.
+    FIELD-SYMBOLS:
+      <ls_root>         TYPE any,
+      <ls_extraction>   TYPE any,
+      <lt_headerfields> TYPE STANDARD TABLE,
+      <ls_hf>           TYPE any,
+      <ls_li>           TYPE any,
+      <lv_name>         TYPE any,
+      <lv_value>        TYPE any.
+
+
+    CLEAR: rv_status, et_fields.
+
+    cl_http_client=>create_by_url(
+      EXPORTING
+        url    = c_base_url
+      IMPORTING
+        client = lo_client ).
+
+    lo_client->request->set_header_field(
+      name  = if_http_header_fields_sap=>request_method
+      value = if_http_request=>co_request_method_get ).
+
+    lo_client->request->set_header_field(
+      name  = if_http_header_fields_sap=>request_uri
+      value = |{ c_api_path }/document/jobs/{ iv_jobid }| ).
+
+    lo_client->request->set_header_field(
+      name  = 'Authorization'
+      value = |Bearer { gv_token }| ).
+
+    lo_client->send( ).
+    lo_client->receive( ).
+
+    lo_client->response->get_status(
+      IMPORTING code = lv_http_code ).
+
+    IF lv_http_code = 200.
+
+      lv_json = lo_client->response->get_cdata( ).
+
+      /ui2/cl_json=>deserialize(
+        EXPORTING json = lv_json
+        CHANGING  data = lr_data ).
+
+      " Job status
+      /ui2/cl_data_access=>create(
+        ir_data      = lr_data
+        iv_component = 'STATUS' )->value(
+          IMPORTING ev_data = rv_status ).
+
+      IF rv_status = 'DONE' OR rv_status = 'FAILED'.
+        lv_status = rv_status.
+        WRITE: / 'Job ID  :', iv_jobid,
+               / 'Status  :', lv_status.
+
+        CLEAR ls_field.
+
+        " Root
+        ASSIGN lr_data->* TO <ls_root>.
+        IF sy-subrc <> 0.
+          RETURN.
+        ENDIF.
+
+        " EXTRACTION
+        ASSIGN COMPONENT 'EXTRACTION' OF STRUCTURE <ls_root> TO <ls_extraction>.
+        IF sy-subrc <> 0.
+          RETURN.
+        ENDIF.
+
+        " HEADERFIELDS
+        WRITE:/ 'Header'.
+        ULINE.
+        ASSIGN COMPONENT 'HEADERFIELDS' OF STRUCTURE <ls_extraction>->* TO FIELD-SYMBOL(<lt_headerfields_fs>).
+
+        IF sy-subrc <> 0.
+          RETURN.
+        ENDIF.
+
+        LOOP AT <lt_headerfields_fs>->* ASSIGNING <ls_hf>.
+          CLEAR ls_field.
+
+          ASSIGN COMPONENT 'NAME'  OF STRUCTURE <ls_hf>->* TO <lv_name>.
+          ASSIGN COMPONENT 'VALUE' OF STRUCTURE <ls_hf>->* TO <lv_value>.
+
+          IF sy-subrc = 0.
+            ls_field-name = |{ <lv_name>->* }|.
+            ls_field-value = |{ <lv_value>->* }|.
+            APPEND ls_field TO ty_field_tab.
+          ENDIF.
+        ENDLOOP.
+
+        LOOP AT ty_field_tab INTO DATA(ls_fields).
+
+          WRITE:/ ls_fields-name, ':' , ls_fields-value.
+        ENDLOOP.
+
+        SKIP 1.
+        ULINE.
+*Line items
+        REFRESH ty_field_tab.
+        WRITE:/ 'Line Items'.
+        ULINE.
+        ASSIGN COMPONENT 'LINEITEMS' OF STRUCTURE <ls_extraction>->* TO FIELD-SYMBOL(<lt_lineitems_fs>).
+
+        IF sy-subrc <> 0.
+          RETURN.
+        ENDIF.
+
+        LOOP AT <lt_lineitems_fs>->* ASSIGNING <ls_hf>.
+          CLEAR ls_field.
+
+          LOOP AT <ls_hf>->* ASSIGNING <ls_li>.
+            ASSIGN COMPONENT 'NAME'  OF STRUCTURE <ls_li>->* TO <lv_name>.
+            ASSIGN COMPONENT 'VALUE' OF STRUCTURE <ls_li>->* TO <lv_value>.
+
+            IF sy-subrc = 0.
+              ls_field-name = |{ <lv_name>->* }|.
+              ls_field-value = |{ <lv_value>->* }|.
+              APPEND ls_field TO ty_field_tab.
+            ENDIF.
+          ENDLOOP.
+        ENDLOOP.
+
+        LOOP AT ty_field_tab INTO ls_fields.
+
+          WRITE:/ ls_fields-name, ':' , ls_fields-value.
+        ENDLOOP.
+        EXIT.
+
+      ELSE.
+        DO.
+          lv_status = go_extract->get_job_status( iv_jobid ).
+
+          IF lv_status = 'DONE' OR lv_status = 'FAILED'.
+
+            EXIT.
+          ENDIF.
+
+          WAIT UP TO 3 SECONDS.
+        ENDDO.
+      ENDIF.
+
+    ENDIF.
+
+    lo_client->close( ).
+
+  ENDMETHOD.
+
+
+ENDCLASS.
+
+*---------------------------------------------------------------------*
+* Main program
+*---------------------------------------------------------------------*
+START-OF-SELECTION.
+
+  go_extract = NEW lcl_doc_extract( ).
+
+  DATA: lv_filename      TYPE string,
+        gv_filename_only TYPE string,
+        gv_mime          TYPE string.
+
+  lv_filename = p_file.
+  CALL FUNCTION 'SO_SPLIT_FILE_AND_PATH'
+    EXPORTING
+      full_name     = lv_filename
+    IMPORTING
+      stripped_name = gv_filename_only.
+
+  DATA gv_extension TYPE string.
+
+  SPLIT gv_filename_only AT '.' INTO DATA(lv_name) gv_extension.
+  TRANSLATE gv_extension TO LOWER CASE.
+
+  cl_gui_frontend_services=>gui_upload(
+    EXPORTING
+      filename   = lv_filename
+      filetype   = 'BIN'
+    IMPORTING
+      filelength = gv_file_length
+    CHANGING
+      data_tab   = gt_file ).
+
+  CALL FUNCTION 'SCMS_BINARY_TO_XSTRING'
+    EXPORTING
+      input_length = gv_file_length
+    IMPORTING
+      buffer       = gv_xstring
+    TABLES
+      binary_tab   = gt_file.
+
+  IF go_extract->authenticate( ) = abap_true.
+
+    PERFORM get_mime_type USING gv_extension CHANGING gv_mime.
+
+    DATA(lv_jobid) = go_extract->post_document(
+                        iv_file     = gv_xstring
+                        iv_filename = gv_filename_only
+                        iv_mime     = gv_mime ).
+    IF lv_jobid IS NOT INITIAL.
+
+      DATA(lv_status) = go_extract->get_job_status( lv_jobid ).
+
+      SUBMIT zai_extract_data_alv WITH p_jobid = lv_jobid.
+    ELSE.
+      WRITE: / 'Job creation failed'.
+    ENDIF.
+
+  ELSE.
+*    WRITE: / 'OAuth authentication failed'.
+  ENDIF.
+
+FORM get_mime_type USING iv_ext  TYPE string
+                CHANGING cv_mime TYPE string.
+
+  CASE iv_ext.
+    WHEN 'png'.
+      cv_mime = if_rest_media_type=>gc_image_png.
+    WHEN 'jpg' OR 'jpeg'.
+      cv_mime = 'image/jpeg'.
+    WHEN 'pdf'.
+      cv_mime = if_rest_media_type=>gc_appl_pdf.
+    WHEN OTHERS.
+      cv_mime = if_rest_media_type=>gc_appl_octet_stream.
+  ENDCASE.
+
+ENDFORM.

@@ -1,0 +1,219 @@
+REPORT zotc_cust_dashboard_html.
+
+PARAMETERS p_vbeln TYPE likp-vbeln.
+
+DATA: gv_kunnr TYPE likp-kunnr.
+
+DATA: gv_so_count TYPE i,
+      gv_del_cnt  TYPE i,
+      gv_inv_cnt  TYPE i,
+      gv_so_amt   TYPE netwr,
+      gv_del_qty  TYPE lfimg,
+      gv_pending  TYPE i.
+
+DATA: html_string TYPE string.
+
+DATA: lv_so_h TYPE i.
+DATA: lv_del_h TYPE i.
+DATA: lv_inv_h TYPE i.
+
+DATA: lv_so_y TYPE i.
+DATA: lv_del_y TYPE i.
+DATA: lv_inv_y TYPE i.
+
+DATA: gv_inv_amt     TYPE vbrk-netwr,
+      gv_pending_amt TYPE vbrk-netwr.
+
+*---------------------------------------------------------------------*
+* Find Customer
+*---------------------------------------------------------------------*
+
+SELECT SINGLE kunnr
+INTO gv_kunnr
+FROM likp
+WHERE vbeln = p_vbeln.
+
+IF sy-subrc <> 0.
+  MESSAGE 'Delivery not found' TYPE 'E'.
+ENDIF.
+
+*---------------------------------------------------------------------*
+* Sales Orders
+*---------------------------------------------------------------------*
+
+SELECT COUNT(*),
+       SUM( netwr )
+  INTO (@gv_so_count, @gv_so_amt)
+  FROM vbak
+ WHERE kunnr = @gv_kunnr.
+
+IF gv_so_amt IS INITIAL.
+  gv_so_amt = 0.
+ENDIF.
+
+*---------------------------------------------------------------------*
+* Deliveries
+*---------------------------------------------------------------------*
+
+SELECT COUNT(*)
+INTO gv_del_cnt
+FROM likp
+WHERE kunnr = gv_kunnr.
+
+SELECT SUM( lfimg )
+INTO gv_del_qty
+FROM lips
+WHERE vbeln IN
+( SELECT vbeln FROM likp WHERE kunnr = gv_kunnr ).
+
+*---------------------------------------------------------------------*
+* Invoices
+*---------------------------------------------------------------------*
+
+SELECT COUNT(*),
+       SUM( netwr )
+  INTO ( @gv_inv_cnt, @gv_inv_amt )
+  FROM vbrk
+ WHERE fkart = 'F2'
+   AND kunag = @gv_kunnr.
+
+gv_pending = gv_del_cnt - gv_inv_cnt.
+gv_pending_amt = gv_so_amt - gv_inv_amt.
+
+
+*---------------------------------------------------------------------*
+* Chart Scaling
+*---------------------------------------------------------------------*
+
+lv_so_h  = gv_so_count * 10.
+lv_del_h = gv_del_cnt * 10.
+lv_inv_h = gv_inv_cnt * 10.
+
+lv_so_y  = 250 - lv_so_h.
+lv_del_y = 250 - lv_del_h.
+lv_inv_y = 250 - lv_inv_h.
+
+*---------------------------------------------------------------------*
+* HTML Dashboard
+*---------------------------------------------------------------------*
+
+DATA: lv_max TYPE i.
+
+lv_max = gv_so_count.
+
+IF gv_del_cnt > lv_max.
+  lv_max = gv_del_cnt.
+ENDIF.
+
+IF gv_inv_cnt > lv_max.
+  lv_max = gv_inv_cnt.
+ENDIF.
+
+DATA: lv_scale TYPE f.
+
+lv_scale = 180 / lv_max.   "180px max bar height
+
+lv_so_h  = gv_so_count * lv_scale.
+lv_del_h = gv_del_cnt  * lv_scale.
+lv_inv_h = gv_inv_cnt  * lv_scale.
+
+lv_so_y  = 200 - lv_so_h.
+lv_del_y = 200 - lv_del_h.
+lv_inv_y = 200 - lv_inv_h.
+
+html_string =
+
+`<html><head>` &&
+
+`<style>` &&
+
+`body{font-family:Arial;background:#eef2f7;margin:0;padding:10px}` &&
+
+`.title{font-size:20px;font-weight:bold;text-align:center;margin-bottom:10px}` &&
+
+`table{width:100%;border-spacing:10px}` &&
+
+`.tile{color:white;border-radius:10px;padding:12px;text-align:center;` &&
+`box-shadow:0 3px 8px rgba(0,0,0,0.25)}` &&
+
+`.value{font-size:24px;font-weight:bold}` &&
+`.label{font-size:13px;margin-top:3px}` &&
+
+`.blue{background:#2980b9}` &&
+`.purple{background:#8e44ad}` &&
+`.green{background:#27ae60}` &&
+`.orange{background:#e67e22}` &&
+
+`.chart{text-align:center;margin-top:10px}` &&
+
+`</style></head><body>` &&
+
+`<div class="title">Customer Sales Dashboard</div>` &&
+
+`<table>` &&
+`<tr>` &&
+
+`<td class="tile blue">` &&
+`<div class="value">` && gv_so_count && `</div>` &&
+`<div class="label">Sales Orders</div>` &&
+`<div style="font-size:12px">` && gv_so_amt && ` Amount</div>` &&
+`</td>` &&
+
+`<td class="tile purple">` &&
+`<div class="value">` && gv_del_cnt && `</div>` &&
+`<div class="label">Deliveries</div>` &&
+`<div style="font-size:12px">` && gv_del_qty && ` Qty</div>` &&
+`</td>` &&
+
+`<td class="tile green">` &&
+`<div class="value">` && gv_inv_cnt && `</div>` &&
+`<div class="label">Invoices</div>` &&
+`</td>` &&
+
+`<td class="tile orange">` &&
+`<div class="value">` && gv_pending && `</div>` &&
+`<div class="label">Pending Billing</div>` &&
+`<div style="font-size:12px">` && gv_pending_amt && ` Amount</div>` &&
+`</td>` &&
+
+
+`</tr>` &&
+`</table>` &&
+
+
+`<div class="chart">` &&
+`<h4>Document Distribution</h4>` &&
+
+`<svg width="360" height="180">` &&
+
+"Sales Orders
+`<rect x="40" y="` && lv_so_y && `" width="40" height="` && lv_so_h && `" fill="#2980b9"/>` &&
+`<text x="60" y="` && lv_so_y && `" text-anchor="middle" font-size="11">` && gv_so_count && `</text>` &&
+`<text x="60" y="165" text-anchor="middle" font-size="11">SO</text>` &&
+
+"Deliveries
+`<rect x="150" y="` && lv_del_y && `" width="40" height="` && lv_del_h && `" fill="#8e44ad"/>` &&
+`<text x="170" y="` && lv_del_y && `" text-anchor="middle" font-size="11">` && gv_del_cnt && `</text>` &&
+`<text x="170" y="165" text-anchor="middle" font-size="11">DEL</text>` &&
+
+"Invoices
+`<rect x="260" y="` && lv_inv_y && `" width="40" height="` && lv_inv_h && `" fill="#27ae60"/>` &&
+`<text x="280" y="` && lv_inv_y && `" text-anchor="middle" font-size="11">` && gv_inv_cnt && `</text>` &&
+`<text x="280" y="165" text-anchor="middle" font-size="11">INV</text>` &&
+
+`</svg>` &&
+
+`</div>` &&
+
+`</body></html>`.
+
+*---------------------------------------------------------------------*
+* Popup Display
+*---------------------------------------------------------------------*
+
+cl_abap_browser=>show_html(
+  EXPORTING
+    html_string = html_string
+    size        = 'M'
+    title       = 'Customer Sales Dashboard'
+).
